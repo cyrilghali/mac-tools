@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Unsubscribe from newsletters and junk seen by Mail.app.
+
+Candidates: messages carrying a List-Unsubscribe header that Mail.app filed
+under Promotions or Junk/Spam, plus senders matching ~/.config/mail-unsub/always.
+Senders matching ~/.config/mail-unsub/never are left alone (substring match).
+One attempt per sender, retried up to 3 times if mail keeps coming.
+State: ~/.local/state/mail-unsub/state.json.   Usage: mail-unsub [--dry-run]
+"""
+import email.parser, glob, json, re, sqlite3, subprocess, sys, time, unicodedata, urllib.parse, urllib.request
+from pathlib import Path
+
+HOME = Path.home()
+MAIL = HOME / "Library/Mail/V10"
+CONF = HOME / ".config/mail-unsub"
+STATE = HOME / ".local/state/mail-unsub/state.json"
+PROMOTIONS = 3
+JUNK = {"junk", "spam", "courrier indésirable"}
+RETRY_AFTER = 7 * 86400
+MAX_ATTEMPTS = 3
+DRY = "--dry-run" in sys.argv
+
+def words(name):
+    p = CONF / name
+    return [l.strip().lower() for l in p.read_text().splitlines() if l.strip()] if p.exists() else []
+
+def mailbox_dir(url):
+    scheme, _, rest = url.partition("://")
+    if scheme != "imap":
+        return None, None
+    acct, *segs = [urllib.parse.unquote(s) for s in rest.split("/")]
+    return MAIL / acct / "/".join(s + ".mbox" for s in segs), unicodedata.normalize("NFC", segs[-1]).lower()
+
+def headers(rowid, mbox):
+    files = glob.glob(f"{mbox}/**/Messages/{rowid}.emlx", recursive=True) + glob.glob(f"{mbox}/**/Messages/{rowid}.partial.emlx", recursive=True)
+    if not files:
+        return None
+    raw = Path(files[0]).read_bytes()
+    return email.parser.BytesHeaderParser().parsebytes(raw[raw.index(b"\n") + 1:])
+
+def candidates():
+    db = sqlite3.connect(f"file:{MAIL}/MailData/Envelope Index?mode=ro", uri=True)
+    rows = db.execute("""
+        select m.ROWID, mb.url, lower(a.address), m.date_received, g.model_category
+        from messages m
+        join addresses a on a.ROWID = m.sender
+        join mailboxes mb on mb.ROWID = m.mailbox
+        left join message_global_data g on g.ROWID = m.global_message_id
+        where m.unsubscribe_type != 0 and m.deleted = 0
+        order by m.date_received desc""").fetchall()
+    always, never = words("always"), words("never")
+    newest = {}
+    for rowid, url, sender, date, cat in rows:
+        mbox, name = mailbox_dir(url)
+        if mbox is None or any(w in sender for w in never):
+            continue
+        if not (cat == PROMOTIONS or name in JUNK or any(w in sender for w in always)):
+            continue
+        newest.setdefault(sender, (rowid, mbox, date))
+    return newest
+
+def one_click(url):
+    req = urllib.request.Request(url, data=b"List-Unsubscribe=One-Click", method="POST",
+                                 headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": "Mozilla/5.0"})
+    return urllib.request.urlopen(req, timeout=20).status
+
+def http_get(url):
+    return urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"}), timeout=20).status
+
+ACCOUNTS = None
+def send_mail(hdrs, mailto):
+    global ACCOUNTS
+    if ACCOUNTS is None:
+        out = subprocess.check_output(["osascript", "-e", 'tell application "Mail" to get email addresses of every account'], text=True)
+        ACCOUNTS = [a.strip() for a in out.split(",")]
+    received = " ".join(str(hdrs.get(h, "")) for h in ("To", "Cc", "Delivered-To", "Original-recipient", "X-Original-To")).lower()
+    sender = next((a for a in ACCOUNTS if a.lower() in received), ACCOUNTS[0])
+    u = urllib.parse.urlparse(mailto)
+    q = urllib.parse.parse_qs(u.query)
+    subject = q.get("subject", ["unsubscribe"])[0]
+    body = q.get("body", ["unsubscribe"])[0]
+    script = '''on run argv
+        set {snd, rcpt, subj, bdy} to argv
+        tell application "Mail"
+            set m to make new outgoing message with properties {sender:snd, subject:subj, content:bdy, visible:false}
+            tell m to make new to recipient at end of to recipients with properties {address:rcpt}
+            send m
+        end tell
+    end run'''
+    subprocess.run(["osascript", "-e", script, sender, u.path, subject, body], check=True, capture_output=True, text=True)
+    return f"sent from {sender}"
+
+def purge_drafts(addresses):
+    """Mail.app autosaves a draft on the server before sending; in a burst the copy can outlive the send."""
+    script = '''on run argv
+        set n to 0
+        tell application "Mail"
+            repeat with acc in accounts
+                set ms to (messages of mailbox "Drafts" of acc whose subject starts with "unsubscribe")
+                repeat with m in ms
+                    if (address of to recipient 1 of m) is in argv then
+                        delete m
+                        set n to n + 1
+                    end if
+                end repeat
+            end repeat
+        end tell
+        return n
+    end run'''
+    out = subprocess.run(["osascript", "-e", script, *addresses], capture_output=True, text=True)
+    return out.stdout.strip()
+
+def unsubscribe(hdrs):
+    links = [l.strip("<> ") for l in str(hdrs.get("List-Unsubscribe", "")).split(",")]
+    https = next((l for l in links if l.startswith("http")), None)
+    mailto = next((l for l in links if re.match(r"mailto:[^@\s?]+@[^@\s?]+(\?|$)", l)), None)
+    if https and hdrs.get("List-Unsubscribe-Post"):
+        try:
+            return "one-click", https, one_click(https)
+        except Exception:
+            if not mailto:
+                return "http-get", https, http_get(https)
+    if mailto:
+        return "mailto", mailto, send_mail(hdrs, mailto)
+    if https:
+        return "http-get", https, http_get(https)
+    raise ValueError("no usable List-Unsubscribe link")
+
+def main():
+    state = json.loads(STATE.read_text()) if STATE.exists() else {}
+    now = int(time.time())
+    for sender, (rowid, mbox, date) in candidates().items():
+        prev = state.get(sender)
+        if prev and (date < prev["at"] + RETRY_AFTER or prev["attempts"] >= MAX_ATTEMPTS):
+            continue
+        hdrs = headers(rowid, mbox)
+        if hdrs is None:
+            continue
+        attempts = (prev or {}).get("attempts", 0) + 1
+        if DRY:
+            print(f"would unsubscribe {sender} (attempt {attempts}): {str(hdrs.get('List-Unsubscribe'))[:120]}")
+            continue
+        try:
+            method, url, result = unsubscribe(hdrs)
+            status = "ok"
+        except Exception as e:
+            method, url, result, status = "-", "-", str(e)[:200], "error"
+        print(f"{time.strftime('%F %T')} {status:5} {sender} attempt={attempts} {method} {result} {url[:100]}")
+        state[sender] = {"at": now, "attempts": attempts, "status": status, "method": method, "url": url, "result": str(result)}
+        STATE.write_text(json.dumps(state, indent=1, sort_keys=True))
+    sent_to = [urllib.parse.urlparse(v["url"]).path for v in state.values() if v["method"] == "mailto"]
+    if sent_to and not DRY:
+        time.sleep(10)
+        purged = purge_drafts(sent_to)
+        if purged not in ("", "0"):
+            print(f"purged {purged} leftover draft(s)")
+    stuck = [s for s, v in state.items() if v["attempts"] >= MAX_ATTEMPTS]
+    if stuck:
+        print("still mailing after 3 attempts, unsubscribe by hand:", *stuck, sep="\n  ")
+
+if __name__ == "__main__":
+    main()

@@ -1,0 +1,108 @@
+#!/bin/bash
+# cremote — keep `claude remote-control` servers running on this Mac so the phone can spawn sessions here.
+#
+# Each line of ~/.config/cremote/targets is one server: name, directory, optional flags.
+# Every target becomes a launchd agent (com.cyrilghali.rc-<name>) with KeepAlive, so it survives reboots.
+set -u
+TARGETS=$HOME/.config/cremote/targets
+CLAUDE=$HOME/.local/bin/claude
+
+label()  { echo "com.cyrilghali.rc-$1"; }
+plist()  { echo "$HOME/Library/LaunchAgents/$(label "$1").plist"; }
+logf()   { echo "/tmp/rc-$1.log"; }
+domain() { echo "gui/$(id -u)"; }
+targets() { grep -v '^\s*#' "$TARGETS" | grep -v '^\s*$'; }
+loaded() { launchctl print "$(domain)/$(label "$1")" >/dev/null 2>&1; }
+trusted() { python3 -c "import json,sys;sys.exit(0 if json.load(open('$HOME/.claude.json'))['projects'].get(sys.argv[1],{}).get('hasTrustDialogAccepted') else 1)" "$1"; }
+env_url() { grep -o 'https://claude.ai/code?environment=[A-Za-z0-9_]*' "$(logf "$1")" 2>/dev/null | tail -1; }
+
+write_plist() {
+  local name=$1 dir=$2; shift 2
+  local args="" a
+  for a in "$@"; do args="$args<string>$a</string>"; done
+  cat > "$(plist "$name")" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>Label</key><string>$(label "$name")</string>
+	<key>ProgramArguments</key><array><string>$CLAUDE</string><string>remote-control</string><string>--name</string><string>$name</string><string>--remote-control-session-name-prefix</string><string>$name</string>$args</array>
+	<key>WorkingDirectory</key><string>$dir</string>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>StandardOutPath</key><string>$(logf "$name")</string>
+	<key>StandardErrorPath</key><string>$(logf "$name")</string>
+</dict></plist>
+PLIST
+}
+
+each() { # each <fn> [name] — run fn on one target or all
+  local want=${1:-}; local name dir flags
+  while read -r name dir flags; do
+    [ -n "$want" ] && [ "$want" != "$name" ] && continue
+    dir=${dir/#\~/$HOME}
+    # shellcheck disable=SC2086
+    "$FN" "$name" "$dir" $flags
+  done < <(targets)
+}
+
+do_on() {
+  local name=$1 dir=$2; shift 2
+  [ -d "$dir" ] || { echo "$name: no such directory $dir"; return 1; }
+  write_plist "$name" "$dir" "$@"
+  launchctl bootout "$(domain)" "$(plist "$name")" 2>/dev/null
+  launchctl bootstrap "$(domain)" "$(plist "$name")" && echo "$name: on ($dir)"
+}
+do_off() {
+  local name=$1
+  launchctl bootout "$(domain)" "$(plist "$name")" 2>/dev/null
+  rm -f "$(plist "$name")" && echo "$name: off"
+}
+do_restart() { launchctl kickstart -k "$(domain)/$(label "$1")" && echo "$1: restarted"; }
+do_status() {
+  local name=$1 dir=$2 state url
+  if loaded "$name"; then state=on; else state=off; fi
+  url=$(env_url "$name")
+  printf '%-6s %-4s %-28s %s\n' "$name" "$state" "$dir" "${url:-}"
+}
+
+usage() {
+  cat <<USAGE
+cremote — let the phone start Claude Code sessions on this Mac
+
+  cremote on [name|path]   install and start the launchd agent(s)   (survives reboot)
+                           a path registers a new target named after its folder
+  cremote off [name]       stop and remove the agent(s)
+  cremote only <name>      stop every agent except this one
+  cremote restart [name]   restart, e.g. after \`claude update\`
+  cremote status           what is running and the environment URL of each
+  cremote log <name>       tail the server log
+  cremote targets          edit ~/.config/cremote/targets (name, dir, flags)
+
+Targets: $(targets | awk '{print $1}' | tr '\n' ' ')
+The Mac must be awake to receive a session; \`awake\` keeps it up on AC.
+USAGE
+}
+
+register() { # register <path> — add a target named after the folder, worktree mode when it is a git repo; prints the name
+  local dir name flags=""
+  dir=$(cd "$1" 2>/dev/null && pwd -P) || { echo "no such directory: $1" >&2; return 1; }
+  name=$(basename "$dir")
+  trusted "$dir" || { echo "$dir is not a trusted workspace: run \`claude\` there once, accept the dialog, then retry" >&2; return 1; }
+  git -C "$dir" rev-parse --is-inside-work-tree >/dev/null 2>&1 && flags="--spawn worktree"
+  targets | awk -v n="$name" '$1==n{f=1} END{exit !f}' || printf '%-7s %s  %s\n' "$name" "${dir/#$HOME/~}" "$flags" >> "$TARGETS"
+  echo "$name"
+}
+arg=${2:-}
+[ -d "$arg" ] && [ "${1:-}" = on ] && { arg=$(register "$arg") || exit 1; }
+
+cmd=${1:-}; shift 2>/dev/null
+case "$cmd" in
+  on)      FN=do_on      each "$arg" ;;
+  off)     FN=do_off     each "${1:-}" ;;
+  only)    [ -n "$arg" ] || { usage; exit 1; }; FN=do_off each ""; FN=do_on each "$arg" ;;
+  restart) FN=do_restart each "${1:-}" ;;
+  status)  FN=do_status  each "" ;;
+  log)     [ -n "${1:-}" ] || { usage; exit 1; }; tail -n 30 "$(logf "$1")" ;;
+  targets) "${EDITOR:-code --wait}" "$TARGETS" ;;
+  *)       usage; exit 1 ;;
+esac

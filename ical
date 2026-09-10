@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""ical — pilote Calendrier.app (iCloud, Google…) en ligne de commande.
+
+  ical ls                                   calendriers (nom · compte)
+  ical events <cal> <from> [to]             événements de la plage (uuid · début · titre)
+  ical add <cal> "<titre>" "<YYYY-MM-DD HH:MM>" [-m MIN] [-d "desc"]
+  ical rm <cal> <uuid>...                   supprime par uuid
+  ical clear <cal> <from> [to]              supprime tous les événements de la plage
+  ical import <cal> <fichier.ics>           un événement par VEVENT (DTSTART/DTEND/SUMMARY/DESCRIPTION)
+
+Dates : "YYYY-MM-DD" ou "YYYY-MM-DD HH:MM", interprétées dans $ICAL_TZ (défaut Europe/Paris),
+quel que soit le fuseau du Mac. Lecture : base SQLite de Calendrier (peut retarder de
+quelques secondes sur une écriture). Écriture : AppleScript, par uuid — jamais de `whose`,
+qui balaie tout le calendrier et met des minutes.
+"""
+import os, re, sqlite3, subprocess, sys
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
+TZ = ZoneInfo(os.environ.get("ICAL_TZ", "Europe/Paris"))
+DB = os.path.expanduser("~/Library/Group Containers/group.com.apple.calendar/Calendar.sqlitedb")
+EPOCH = 978307200  # 2001-01-01, origine des dates Apple
+
+
+def osa(script):
+    r = subprocess.run(["osascript", "-"], input=script, capture_output=True, text=True)
+    if r.returncode:
+        sys.exit(r.stderr.strip())
+    return r.stdout.rstrip("\n")
+
+
+def db():
+    return sqlite3.connect(f"file:{DB}?mode=ro", uri=True)
+
+
+def cal_id(name):
+    rows = db().execute("select ROWID from Calendar where title=? and external_id<>''", (name,)).fetchall()
+    if not rows:
+        sys.exit(f"calendrier inconnu : {name}")
+    return rows[0][0]
+
+
+def parse(s):
+    for f in ("%Y-%m-%d %H:%M", "%Y-%m-%d"):
+        try:
+            return datetime.strptime(s, f).replace(tzinfo=TZ)
+        except ValueError:
+            pass
+    sys.exit(f"date illisible : {s}")
+
+
+def span(a):
+    f = parse(a[0])
+    t = parse(a[1]) if len(a) > 1 else f
+    if len(a) == 1 or len(a[1]) == 10:
+        t += timedelta(days=1)
+    return f, t
+
+
+def q(s):
+    return '"' + s.replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def asdate(var, d):
+    """AppleScript posant `var` sur l'instant d, exprimé dans l'heure locale du Mac."""
+    d = d.astimezone()
+    return (f"set {var} to current date\nset day of {var} to 1\nset year of {var} to {d.year}\n"
+            f"set month of {var} to {d.month}\nset day of {var} to {d.day}\n"
+            f"set time of {var} to {d.hour * 3600 + d.minute * 60}\n")
+
+
+def in_cal(cal, body):
+    return f'tell application "Calendar"\ntell calendar {q(cal)}\n{body}\nend tell\nend tell'
+
+
+def new_event(title, s, e, desc):
+    return asdate("s", s) + asdate("e", e) + (
+        f"make new event with properties {{summary:{q(title)}, start date:s, end date:e, description:{q(desc)}}}\n")
+
+
+def cmd_ls(_):
+    for title, ext in db().execute("select title, external_id from Calendar where external_id like '/%' order by ROWID"):
+        if ext.endswith(("/inbox/", "/notification/")):
+            continue
+        acct = "Google" if "/calendar/dav/" in ext else "iCloud"
+        print(f"{'Calendar' if title == 'DEFAULT_CALENDAR_NAME' else title}\t{acct}")
+
+
+def rows(cal, a):
+    f, t = span(a)
+    return db().execute(
+        "select UUID, start_date, summary from CalendarItem where calendar_id=? and start_date>=? and start_date<? order by start_date",
+        (cal_id(cal), f.timestamp() - EPOCH, t.timestamp() - EPOCH)).fetchall()
+
+
+def cmd_events(a):
+    for uuid, start, summary in rows(a[0], a[1:]):
+        when = datetime.fromtimestamp(start + EPOCH, TZ).strftime("%a %d/%m %H:%M")
+        print(f"{uuid}\t{when}\t{summary}")
+
+
+def cmd_add(a):
+    cal, title, start = a[0], a[1], parse(a[2])
+    mins = int(a[a.index("-m") + 1]) if "-m" in a else 60
+    desc = a[a.index("-d") + 1] if "-d" in a else ""
+    print(osa(in_cal(cal, new_event(title, start, start + timedelta(minutes=mins), desc).replace(
+        "make new event", "set ev to make new event") + "return uid of ev")))
+
+
+def delete(cal, uuids):
+    if uuids:
+        osa(in_cal(cal, "".join(f"delete (event id {q(u)})\n" for u in uuids) + "return 0"))
+    print(f"{len(uuids)} supprimé(s)")
+
+
+def cmd_rm(a):
+    delete(a[0], a[1:])
+
+
+def cmd_clear(a):
+    delete(a[0], [u for u, _, _ in rows(a[0], a[1:])])
+
+
+def unesc(s):
+    return s.replace("\\n", "\n").replace("\\,", ",").replace("\\;", ";").replace("\\\\", "\\")
+
+
+def cmd_import(a):
+    cal, path = a[0], a[1]
+    text = re.sub(r"\n[ \t]", "", open(path, encoding="utf-8").read().replace("\r\n", "\n"))
+    body, n = "", 0
+    for ev in re.findall(r"BEGIN:VEVENT\n(.*?)\nEND:VEVENT", text, re.S):
+        p = dict(re.findall(r"^([A-Z-]+)(?:;[^:\n]*)?:(.*)$", ev, re.M))
+        s = datetime.strptime(p["DTSTART"][:15], "%Y%m%dT%H%M%S").replace(tzinfo=TZ)
+        e = datetime.strptime(p["DTEND"][:15], "%Y%m%dT%H%M%S").replace(tzinfo=TZ) if "DTEND" in p else s + timedelta(hours=1)
+        body += new_event(unesc(p.get("SUMMARY", "")), s, e, unesc(p.get("DESCRIPTION", "")))
+        n += 1
+    osa(in_cal(cal, body + "return 0"))
+    print(f"{n} événement(s) importé(s) dans {cal}")
+
+
+if __name__ == "__main__":
+    cmds = {k[4:]: v for k, v in globals().items() if k.startswith("cmd_")}
+    if len(sys.argv) < 2 or sys.argv[1] not in cmds:
+        sys.exit(__doc__)
+    cmds[sys.argv[1]](sys.argv[2:])

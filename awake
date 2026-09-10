@@ -1,0 +1,110 @@
+#!/bin/bash
+# awake — keep this Mac awake for Claude sessions, and only then.
+#
+#   hold    = claude sessions exist AND (on AC, OR battery above the idle line, OR working above the floor)
+#   working = a session transcript was written in the last AWAKE_IDLE_MIN minutes
+#   lid     = with AWAKE_LID=1, a closed lid on AC stays awake while holding (needs sudoers, see help)
+#
+# Tunables live in ~/.config/awake (sourced): AWAKE_IDLE_MIN=10 AWAKE_BATTERY_IDLE=50 AWAKE_BATTERY_FLOOR=20 AWAKE_LID=0
+set -u
+[ -f "$HOME/.config/awake" ] && . "$HOME/.config/awake"
+IDLE_MIN=${AWAKE_IDLE_MIN:-10}
+FLOOR=${AWAKE_BATTERY_FLOOR:-20}
+IDLE_ABOVE=${AWAKE_BATTERY_IDLE:-50}
+LID=${AWAKE_LID:-0}
+LOG=/tmp/awake.log
+LABEL=com.cyrilghali.awake
+PLIST=$HOME/Library/LaunchAgents/$LABEL.plist
+
+sessions() { pgrep -x claude | wc -l | tr -d ' '; }
+on_ac()    { pmset -g batt | grep -q 'AC Power'; }
+battery()  { pmset -g batt | grep -o '[0-9]*%' | tr -d '%'; }
+working()  { [ -n "$(find "$HOME/.claude/projects" -name '*.jsonl' -mmin "-$IDLE_MIN" -print -quit 2>/dev/null)" ]; }
+log()      { echo "$(date '+%F %T') $*"; }
+why()      { echo "$(sessions) sessions, $(on_ac && echo AC || echo "battery $(battery)%"), $(working && echo working || echo idle)"; }
+
+should_hold() {
+  [ "$(sessions)" -gt 0 ] || return 1
+  on_ac && return 0
+  local b; b=$(battery)
+  [ "$b" -gt "$IDLE_ABOVE" ] && return 0
+  working && [ "$b" -gt "$FLOOR" ]
+}
+
+lid_hold() { # 1 = closed lid stays awake, 0 = normal
+  [ "$LID" = 1 ] || return 1
+  sudo -n /usr/bin/pmset -a disablesleep "$1" 2>/dev/null || log "lid: sudo pmset refused, run the sudoers line from 'awake help'"
+}
+
+daemon() {
+  local held=0 lid=0 pid=
+  trap 'kill $pid 2>/dev/null; [ $lid = 1 ] && lid_hold 0; exit' INT TERM EXIT
+  log "start ($(why))"
+  while :; do
+    local want_hold=0 want_lid=0
+    should_hold && want_hold=1
+    [ $want_hold = 1 ] && on_ac && want_lid=1
+    if [ $want_hold != $held ]; then
+      if [ $want_hold = 1 ]; then caffeinate -i -s -w $$ & pid=$!; log "hold ($(why))"
+      else kill $pid 2>/dev/null; log "release ($(why))"; fi
+      held=$want_hold
+    fi
+    if [ $want_lid != $lid ]; then lid_hold $want_lid && log "lid $([ $want_lid = 1 ] && echo held || echo free)"; lid=$want_lid; fi
+    sleep 30
+  done
+}
+
+status() {
+  local state=released
+  pgrep -fq 'caffeinate -i -s -w' && state=holding
+  echo "$state ($(why); idle ok above $IDLE_ABOVE%, working above $FLOOR%, idle after ${IDLE_MIN}m)"
+  echo "lid: $([ "$(pmset -g | awk '/SleepDisabled/{print $2}')" = 1 ] && echo held || echo free)$([ "$LID" = 1 ] || echo ' (AWAKE_LID off)')"
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 && echo "daemon: running" || echo "daemon: not installed"
+}
+
+install() {
+  cat > "$PLIST" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0"><dict>
+	<key>Label</key><string>$LABEL</string>
+	<key>ProgramArguments</key><array><string>$HOME/.local/bin/awake</string><string>daemon</string></array>
+	<key>RunAtLoad</key><true/>
+	<key>KeepAlive</key><true/>
+	<key>StandardOutPath</key><string>$LOG</string>
+	<key>StandardErrorPath</key><string>$LOG</string>
+</dict></plist>
+PLIST
+  launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+  while launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; do sleep 0.5; done
+  launchctl bootstrap "gui/$(id -u)" "$PLIST" && sleep 1 && status
+}
+
+check() { # the hold policy, table-driven: sessions ac battery working → expected
+  local fails=0 row S A B W E
+  for row in "0 1 100 1 1" "1 1 100 0 0" "1 0 60 0 0" "1 0 50 1 0" "1 0 50 0 1" "1 0 15 1 1" "0 0 90 0 1"; do
+    read -r S A B W E <<< "$row"
+    sessions() { echo "$S"; }; on_ac() { [ "$A" = 1 ]; }; battery() { echo "$B"; }; working() { [ "$W" = 1 ]; }
+    should_hold; [ $? = "$E" ] || { echo "FAIL: $row"; fails=1; }
+  done
+  [ $fails = 0 ] && echo "check ok"; return $fails
+}
+
+uninstall() { launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null; rm -f "$PLIST"; echo "removed"; }
+
+help() {
+  sed -n '2,8p' "$0" | cut -c3-
+  cat <<HELP
+
+usage: awake [status|install|uninstall|daemon|check|help]     log: $LOG
+
+closed-lid mode (once, needs your password):
+  ! sudo install -m 0440 /dev/stdin /etc/sudoers.d/awake <<< "$USER ALL=(root) NOPASSWD: /usr/bin/pmset -a disablesleep 0, /usr/bin/pmset -a disablesleep 1"
+  echo AWAKE_LID=1 >> ~/.config/awake && awake install
+HELP
+}
+
+case "${1:-status}" in
+  status|install|uninstall|daemon|check|help) "$1" ;;
+  *) help; exit 1 ;;
+esac
