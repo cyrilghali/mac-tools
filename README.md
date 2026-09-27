@@ -1,6 +1,6 @@
 # mac-tools
 
-Five single-file command line tools for a Mac that runs Claude Code sessions all day. No dependencies beyond what macOS ships, plus `gh`, `jq` or Ollama where a tool says so. Drop one in your `PATH` and it works.
+Six single-file command line tools for a Mac that runs Claude Code sessions all day. No dependencies beyond what macOS ships, plus `gh`, `jq` or Ollama where a tool says so. Drop one in your `PATH` and it works.
 
 | Tool | What it does |
 |---|---|
@@ -8,6 +8,7 @@ Five single-file command line tools for a Mac that runs Claude Code sessions all
 | `cremote` | Keeps `claude remote-control` servers alive under launchd, so a phone can start sessions on this Mac |
 | `ical` | Drives Calendar.app from the shell: list, add, remove, import, clear a date range |
 | `mail-unsub` | Unsubscribes from every newsletter Mail.app filed under Promotions or Junk |
+| `routines` | Shows every launchd routine on one screen, grouped and colored, and flags the broken ones |
 | `veille` | Summarises unread Newsboat articles with Claude, filtered by tag and age |
 
 ## Why hold the Mac awake conditionally?
@@ -54,6 +55,19 @@ mail-unsub
 ```
 
 Candidates are messages carrying a `List-Unsubscribe` header that Mail.app filed under Promotions or Junk. `~/.config/mail-unsub/always` forces a sender in, `never` protects one, both by substring. State lives in `~/.local/state/mail-unsub/state.json`.
+
+## What does routines show?
+
+One line per launchd job: what it does, how often and at what time, its next run and whether it is healthy. It reads three optional plist keys launchd ignores: `Description` (the WHAT column), `Tags` (the groups) and `Frequency` (for a script that gates itself, such as hourly slots that run once a month).
+
+```sh
+routines                          # every routine, grouped by tag
+routines --tag work --sort next   # one group, soonest first
+routines --columns name,what,next # only these columns
+routines --problems               # only the broken ones, with evidence; for a daily job
+```
+
+It flags a nonzero last exit, a job that never ran on schedule, a stale log and a command missing from the job's own `PATH`. Python 3 standard library only.
 
 ## Install
 
