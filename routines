@@ -22,7 +22,7 @@ cron/launchd routine should call.
   routine_watchdog.py                        table of every routine, healthy or not
   routine_watchdog.py --sort next            sort by label (default), next, last or status
   routine_watchdog.py --failing              only rows whose status is not ok
-  routine_watchdog.py --tag riot             only rows whose Tags list holds the tag
+  routine_watchdog.py --tag work             only rows whose Tags list holds the tag
   routine_watchdog.py --grep backup          only rows whose label, schedule, what or tags match
   routine_watchdog.py --columns name,what    only these columns, in this order
   routine_watchdog.py --prefix com.example.  only labels with this prefix (comma-separated)
@@ -624,13 +624,13 @@ def parse_columns(text):
 def main(argv=None):
     ap = argparse.ArgumentParser(
         prog="routines", description="Health and schedule of every launchd routine.",
-        epilog="examples: routines --tag riot | routines --sort next | routines --failing | routines --columns name,what,next")
+        epilog="examples: routines --tag work | routines --sort next | routines --failing | routines --columns name,what,next")
     ap.add_argument("--problems", action="store_true",
                     help="print only flagged routines with evidence, or one 'all N routines healthy' line")
     ap.add_argument("--sort", choices=SORT_KEYS, default="label", help="table order (default: label)")
     ap.add_argument("--failing", action="store_true", help="only rows whose status is not ok")
     ap.add_argument("--grep", metavar="TEXT", help="only rows whose label, schedule, what or tags contain TEXT")
-    ap.add_argument("--tag", metavar="TAG", help="only rows tagged TAG (the plist's Tags list), e.g. riot")
+    ap.add_argument("--tag", metavar="TAG", help="only rows tagged TAG (the plist's Tags list), e.g. work")
     ap.add_argument("--prefix", metavar="PREFIXES",
                     help="comma-separated label prefixes (overrides ROUTINE_WATCHDOG_PREFIX)")
     ap.add_argument("--columns", metavar="LIST", type=parse_columns,
@@ -692,8 +692,8 @@ def self_test():
     assert [r["label"] for r in filter_rows(rows, failing=True)] == ["a"]
     assert [r["label"] for r in filter_rows(rows, grep="DISK")] == ["b"]
     assert [r["label"] for r in filter_rows(rows, grep="daily")] == ["c"]
-    rows[0]["tags"], rows[1]["tags"], rows[2]["tags"] = ["riot"], ["personal", "riot"], []
-    assert [r["label"] for r in filter_rows(rows, tag="RIOT")] == ["b", "a"]
+    rows[0]["tags"], rows[1]["tags"], rows[2]["tags"] = ["work"], ["personal", "work"], []
+    assert [r["label"] for r in filter_rows(rows, tag="WORK")] == ["b", "a"]
     assert [r["label"] for r in filter_rows(rows, grep="person")] == ["a"]
     assert short_names(["com.me.backup", "com.me.cal", "fr.shop.seo", "sh.brew.ollama", "solo"]) == {
         "com.me.backup": "backup", "com.me.cal": "cal", "fr.shop.seo": "shop.seo",
@@ -719,7 +719,7 @@ def self_test():
     assert schedule_parts({"KeepAlive": True}) == ("always on", "-")
     import io, contextlib
     rows[0]["what"] = "Prunes forks, worktrees, caches, Docker images"
-    rows.append(dict(rows[0], label="com.me.auto-revocation-health", status="ok", tags=["Riot"],
+    rows.append(dict(rows[0], label="com.me.monthly-report", status="ok", tags=["Work"],
                      frequency="monthly, 1st weekday", at="11:00, 14:00, 17:00",
                      what="Health of Sonar's monthly auto-revocation run"))
     rows = [dict(r, last_exit="-", last_run="1h ago", schedule="Mon 12:00") for r in rows]
