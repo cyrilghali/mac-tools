@@ -721,7 +721,7 @@ def self_test():
     rows[0]["what"] = "Prunes forks, worktrees, caches, Docker images"
     rows.append(dict(rows[0], label="com.me.monthly-report", status="ok", tags=["Work"],
                      frequency="monthly, 1st weekday", at="11:00, 14:00, 17:00",
-                     what="Health of Sonar's monthly auto-revocation run"))
+                     what="Monthly report of last month's invoices"))
     rows = [dict(r, last_exit="-", last_run="1h ago", schedule="Mon 12:00") for r in rows]
     for w in (40, 60, 80, 120, 200):
         for cols in (None, ["name", "what"], ["status", "name", "frequency", "at", "next", "last", "what"]):
